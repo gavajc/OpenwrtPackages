@@ -178,7 +178,7 @@ class SysDiagnosticCollector:
             resolved_ip = socket.gethostbyname(host)
             return Result(success=True, data={"status": "success", "host": host, "resolved_ip": resolved_ip})
         except socket.gaierror as e:
-            return Result(success=True, data={"status": "failed", "host": host, "resolved_ip": None})
+            return Result(success=False, data={"status": "failed", "host": host, "resolved_ip": None})
 
     def run_latency_test(self, host, port):
         # Estimates network latency utilizing strict TCP errno inspection and Result patterns
@@ -362,12 +362,19 @@ class SysDiagnosticCollector:
         free_mem = report["resources"].get("free_memory_kb", -1)
         load_summary = report["system"].get("load_average_summary", -1.0)
 
-        if (self.total_memory_kb > 0 and free_mem >= 0 and (free_mem / self.total_memory_kb) < 0.05) or (load_summary > 4.0):
+        if ((self.total_memory_kb > 0 and free_mem >= 0 and (free_mem / self.total_memory_kb) < 0.05)
+            or (load_summary > 4.0)
+            or (not dns_test_res.success and not lat_test_res.success)
+        ):
             report["health"]["status"] = "critical"
             if load_summary > 4.0:
                 reasons.append("high_cpu_load")
             if self.total_memory_kb > 0 and free_mem >= 0 and (free_mem / self.total_memory_kb) < 0.05:
                 reasons.append("out_of_memory")
+            if not dns_test_res.success:
+                reasons.append("dns_test_failed")
+            if not lat_test_res.success:
+                reasons.append("latency_test_failed")
 
         # Degraded or infrastructure failure condition evaluations
         if report["health"]["status"] != "critical":

@@ -121,7 +121,7 @@ En el momento que se creo este repositorio la URL de webhook es: https://webhook
 
 El mecanismo de health implementado es el siguiente:
 
-	CRITICO: Cuando el load average es superior al 4.0 o la memoria RAM < 5%
+	CRITICO: Cuando el load average es superior al 4.0 o la memoria RAM < 5% y ambos tests de RED fallan(no hay resolucion DNS y no se puede obtener la latencia TCP).
 	DEGRADED: Cuando algun test de conectividad fallo o no esta en ejecución alguno de los servicios monitoreados (dnsmasq, dropbear, firewall).
 	OK: No se presento ninguno de los 2 anteriores.
 
