@@ -44,7 +44,7 @@ poll_obj.register(pipe_read_fd, select.POLLIN)
 def signal_handler(signum, frame):
     # Dynamic signal handler to catch incoming SIGTERM or SIGINT from procd
     global keep_running
-    syslog.syslog(syslog.LOG_INFO, f"Service received signal ({signum}). Initiating graceful teardown sequence.")
+    syslog.syslog(syslog.LOG_DEBUG, f"Service received signal ({signum}). Initiating graceful teardown sequence.")
     keep_running = False
     
     # The Self-Pipe Trick: Write an atomic NOP byte to unblock the kernel poll immediately
@@ -69,6 +69,23 @@ def load_uci_configuration():
         return
     
     try:
+        # Agregamos la mascara para que se envien los debug a logread si es que esta configurado en
+        # el archivo de configuracion /etc/config/sysdiagnostic sección system si no esta la sección
+        # o no se encuentra la clave debug se deshabilitan los LOG_DEBUG
+        is_debug = False
+        try:
+            debug_val = str(ctx.get("sysdiagnostic", "system", "debug")).lower()
+            is_debug = debug_val in ("1", "true", "on", "yes")
+        except uci.UciException:
+            pass
+
+        if is_debug:
+            # Permite todos los niveles desde LOG_EMERG hasta LOG_DEBUG
+            syslog.setlogmask(syslog.LOG_UPTO(syslog.LOG_DEBUG))
+        else:
+            # Permite solo hasta LOG_INFO (silencia automáticamente LOG_DEBUG)
+            syslog.setlogmask(syslog.LOG_UPTO(syslog.LOG_INFO))
+
         # Parse DNS test section attributes
         dns_h = ctx.get("sysdiagnostic", "dns_test", "host")
         if dns_h: config["dns_host"] = dns_h
@@ -288,7 +305,7 @@ def save_to_queue(report_data):
             filename = "status.json"
             os.replace(filepath, status_path)
 
-        syslog.syslog(syslog.LOG_INFO, f"Report successfully buffered locally to offline queue space: {filename}")
+        syslog.syslog(syslog.LOG_DEBUG, f"Report successfully buffered locally to offline queue space: {filename}")
 
     except Exception as e:
         syslog.syslog(syslog.LOG_ERR, f"Failed to execute volatile storage transaction: {str(e)}")
@@ -346,10 +363,11 @@ if __name__ == "__main__":
     
     # Class instantiation mapped through explicit module tracking namespace
     collector = sysdiagnostic_collector.SysDiagnosticCollector()
+    previous_health = "desconocido"
     
     # Kernel driven operational event loop boundary
     while keep_running:
-        syslog.syslog(syslog.LOG_INFO, "Executing diagnostic daemon")
+        syslog.syslog(syslog.LOG_DEBUG, "Executing diagnostic daemon")
         
         # 1. Sync step: try to flush queued history files first
         process_pending_queue()
@@ -369,12 +387,14 @@ if __name__ == "__main__":
         
         # 3. Stream semantic operational summary down into local syslog infrastructure
         health_status = current_report["health"]["status"]
-        syslog.syslog(syslog.LOG_INFO, f"Estado del router: {health_status}")
+        if previous_health != health_status:
+            syslog.syslog(syslog.LOG_INFO, f"Estado del router actual: {health_status} estado previo: {previous_health}")
+            previous_health = health_status
         
         # 4. Process routing logic into upstream endpoints or down to local storage buckets
         if config["api_url"]:
             api_success, api_reason = send_to_api(current_report)
-            syslog.syslog(syslog.LOG_INFO, f"Resultado del envío API: {api_reason}")
+            syslog.syslog(syslog.LOG_DEBUG, f"Resultado del envío API: {api_reason}")
             if not api_success:
                 save_to_queue(current_report)
         else:
