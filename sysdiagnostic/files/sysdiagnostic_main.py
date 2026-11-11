@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 import json
 import os
+import re
 import select
 import signal
 import sys
 import syslog
-import time
 import urllib.error
 import urllib.request
 
@@ -219,6 +219,9 @@ def send_to_api(report_data):
     except Exception as e:
         return False, f"Unexpected Socket Error: {str(e)}"
 
+# Debido al requerimiento (punto 2 del review), para nombrar el ultimo reporte como status.json y para
+# garantizar el orden de los archivos si el timestamp del sistema cambia, refactorice la funcion
+# para utilizar una secuencia en el nombre del archivo.
 def save_to_queue(report_data):
     # Buffers telemetry payloads down to volatile storage when upstream targets are unreachable
     if not os.path.exists(QUEUE_DIR):
@@ -229,23 +232,64 @@ def save_to_queue(report_data):
             return
 
     try:
-        # 1. Enforce physical queue capacity boundaries to protect memory space ceilings
-        files = [os.path.join(QUEUE_DIR, f) for f in os.listdir(QUEUE_DIR) if f.endswith(".json")]
-        if len(files) >= config["max_queued_reports"]:
-            # Sort system items using standard modification timestamps
-            files.sort(key=os.path.getmtime)
-            # Remove the oldest trace on the timeline to maintain balance
-            oldest_file = files[0]
-            os.remove(oldest_file)
-            syslog.syslog(syslog.LOG_WARNING, f"Queue ceiling reached. Purged oldest historical report item: {os.path.basename(oldest_file)}")
+        max_reports = config["max_queued_reports"]
+        status_path = os.path.join(QUEUE_DIR, "status.json")
+        has_status = os.path.exists(status_path)
 
-        # 2. Persist JSON data directly to local disk arrays
-        filename = f"report_{report_data['generated_at'].replace(':', '')}.json"
+        # 1. Listar reportes históricos ordenados por su número de secuencia en el nombre
+        pattern = re.compile(r"^report_(\d+)\.json$")
+        historical_files = []
+        
+        for f in os.listdir(QUEUE_DIR):
+            match = pattern.match(f)
+            if match:
+                seq_num = int(match.group(1))
+                historical_files.append((seq_num, os.path.join(QUEUE_DIR, f)))
+
+        historical_files.sort(key=lambda item: item[0])
+
+        # 1.5 Normalizar: si existe status.json pero la cola NO está llena, pasarlo a histórico
+        # Esto puede suceder si se cambio el tamaño de la cola. Ejemplo que pase de 1 a 10
+        total_files = len(historical_files) + (1 if has_status else 0)
+        if has_status and total_files < max_reports:
+            next_hist_seq = (historical_files[-1][0] + 1) if historical_files else 1
+            restored_name = f"report_{next_hist_seq:06d}.json"
+            restored_path = os.path.join(QUEUE_DIR, restored_name)
+            os.replace(status_path, restored_path)
+            historical_files.append((next_hist_seq, restored_path))
+            has_status = False
+
+        # 2. Deducir la secuencia actual
+        max_historical_seq = historical_files[-1][0] if historical_files else 0
+        status_seq = max_historical_seq + 1 if has_status else 0
+        next_seq = (status_seq + 1) if has_status else (max_historical_seq + 1)
+
+        # 3. Purgar los archivos más antiguos si ya alcanzamos el límite total
+        total_files = len(historical_files) + (1 if has_status else 0)
+        while total_files >= max_reports and historical_files:
+            _, oldest_path = historical_files.pop(0)
+            os.remove(oldest_path)
+            total_files -= 1
+            syslog.syslog(syslog.LOG_WARNING, f"Queue ceiling reached. Purged oldest historical report item: {os.path.basename(oldest_path)}")
+
+        # 4. Escribir el nuevo reporte a /tmp
+        filename = f"report_{next_seq:06d}.json"
         filepath = os.path.join(QUEUE_DIR, filename)
         
         with open(filepath, "w") as f:
             json.dump(report_data, f)
+
+        # 5. Rotar status.json solo al alcanzar el límite máximo
+        if total_files + 1 >= max_reports:
+            if has_status and max_reports > 1:
+                restored_path = os.path.join(QUEUE_DIR, f"report_{status_seq:06d}.json")
+                os.replace(status_path, restored_path)
+
+            filename = "status.json"
+            os.replace(filepath, status_path)
+
         syslog.syslog(syslog.LOG_INFO, f"Report successfully buffered locally to offline queue space: {filename}")
+
     except Exception as e:
         syslog.syslog(syslog.LOG_ERR, f"Failed to execute volatile storage transaction: {str(e)}")
 
@@ -255,15 +299,24 @@ def process_pending_queue():
         return
 
     try:
-        files = [os.path.join(QUEUE_DIR, f) for f in os.listdir(QUEUE_DIR) if f.endswith(".json")]
-        if not files:
-            return
+        # Aplicamos la misma logica que al guardar en /tmp para garantizar se envien a la API en orden
+        status_path = os.path.join(QUEUE_DIR, "status.json")
+        has_status  = os.path.exists(status_path)
+        pattern = re.compile(r"^report_(\d+)\.json$")
+        files = []
+        
+        for f in os.listdir(QUEUE_DIR):
+            match = pattern.match(f)
+            if match:
+                seq_num = int(match.group(1))
+                files.append((seq_num, os.path.join(QUEUE_DIR, f)))
 
-        # Sort the directory array from oldest trace up to the newest record
-        files.sort(key=os.path.getmtime)
+        files.sort(key=lambda item: item[0])
+        if has_status:
+            files.append((0,status_path))
         syslog.syslog(syslog.LOG_INFO, f"Detected {len(files)} unsent diagnostic items in queue. Initiating upstream sync.")
 
-        for filepath in files:
+        for _, filepath in files:
             filename = os.path.basename(filepath)
             try:
                 with open(filepath, "r") as f:

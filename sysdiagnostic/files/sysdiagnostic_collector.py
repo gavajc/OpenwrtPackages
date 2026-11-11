@@ -81,8 +81,14 @@ class SysDiagnosticCollector:
                             status_report[srv] = "OK"
                             continue
                         if srv == "firewall":
-                            status_report[srv] = "OK"
-                            continue
+                            # Punto 2, del review: En sistemas modernos, el firewall no es un demonio activo que este en ejecución
+                            # por lo que no tiene un estado en ubus ni en /proc. Ubus regresa un objeto vacio por lo que para poder 
+                            # medir si esta activo el firewall verificamos que exista el archivo de tablas del kernel tal cual hice en C++.
+                            tablesPath = "/proc/net/ip_tables_names"
+
+                            if os.path.isfile(tablesPath):
+                                status_report[srv] = "OK"
+                                continue
                 status_report[srv] = "fail"
             return Result(success=True, data=status_report)
         except Exception as e:
