@@ -23,6 +23,9 @@ start_service() {
     procd_set_param stdout 1
     procd_set_param stderr 1
 
+    # Required for execute the trigger when execute reload_config command
+    procd_set_param file /etc/config/sysdiagnostic
+
     # Finalize and push the instance configuration down to the supervisor engine
     procd_close_instance
 }
