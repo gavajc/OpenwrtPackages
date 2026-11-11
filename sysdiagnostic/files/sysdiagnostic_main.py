@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 import json
 import os
+import re
 import select
 import signal
 import sys
 import syslog
-import time
 import urllib.error
 import urllib.request
 
@@ -44,7 +44,7 @@ poll_obj.register(pipe_read_fd, select.POLLIN)
 def signal_handler(signum, frame):
     # Dynamic signal handler to catch incoming SIGTERM or SIGINT from procd
     global keep_running
-    syslog.syslog(syslog.LOG_INFO, f"Service received signal ({signum}). Initiating graceful teardown sequence.")
+    syslog.syslog(syslog.LOG_DEBUG, f"Service received signal ({signum}). Initiating graceful teardown sequence.")
     keep_running = False
     
     # The Self-Pipe Trick: Write an atomic NOP byte to unblock the kernel poll immediately
@@ -69,6 +69,23 @@ def load_uci_configuration():
         return
     
     try:
+        # Agregamos la mascara para que se envien los debug a logread si es que esta configurado en
+        # el archivo de configuracion /etc/config/sysdiagnostic sección system si no esta la sección
+        # o no se encuentra la clave debug se deshabilitan los LOG_DEBUG
+        is_debug = False
+        try:
+            debug_val = str(ctx.get("sysdiagnostic", "system", "debug")).lower()
+            is_debug = debug_val in ("1", "true", "on", "yes")
+        except uci.UciException:
+            pass
+
+        if is_debug:
+            # Permite todos los niveles desde LOG_EMERG hasta LOG_DEBUG
+            syslog.setlogmask(syslog.LOG_UPTO(syslog.LOG_DEBUG))
+        else:
+            # Permite solo hasta LOG_INFO (silencia automáticamente LOG_DEBUG)
+            syslog.setlogmask(syslog.LOG_UPTO(syslog.LOG_INFO))
+
         # Parse DNS test section attributes
         dns_h = ctx.get("sysdiagnostic", "dns_test", "host")
         if dns_h: config["dns_host"] = dns_h
@@ -219,6 +236,9 @@ def send_to_api(report_data):
     except Exception as e:
         return False, f"Unexpected Socket Error: {str(e)}"
 
+# Debido al requerimiento (punto 2 del review), para nombrar el ultimo reporte como status.json y para
+# garantizar el orden de los archivos si el timestamp del sistema cambia, refactorice la funcion
+# para utilizar una secuencia en el nombre del archivo.
 def save_to_queue(report_data):
     # Buffers telemetry payloads down to volatile storage when upstream targets are unreachable
     if not os.path.exists(QUEUE_DIR):
@@ -229,23 +249,67 @@ def save_to_queue(report_data):
             return
 
     try:
-        # 1. Enforce physical queue capacity boundaries to protect memory space ceilings
-        files = [os.path.join(QUEUE_DIR, f) for f in os.listdir(QUEUE_DIR) if f.endswith(".json")]
-        if len(files) >= config["max_queued_reports"]:
-            # Sort system items using standard modification timestamps
-            files.sort(key=os.path.getmtime)
-            # Remove the oldest trace on the timeline to maintain balance
-            oldest_file = files[0]
-            os.remove(oldest_file)
-            syslog.syslog(syslog.LOG_WARNING, f"Queue ceiling reached. Purged oldest historical report item: {os.path.basename(oldest_file)}")
+        max_reports = config["max_queued_reports"]
+        status_path = os.path.join(QUEUE_DIR, "status.json")
+        has_status = os.path.exists(status_path)
 
-        # 2. Persist JSON data directly to local disk arrays
-        filename = f"report_{report_data['generated_at'].replace(':', '')}.json"
+        # 1. Listar reportes históricos ordenados por su número de secuencia en el nombre
+        pattern = re.compile(r"^report_(\d+)\.json$")
+        historical_files = []
+        
+        for f in os.listdir(QUEUE_DIR):
+            match = pattern.match(f)
+            if match:
+                seq_num = int(match.group(1))
+                historical_files.append((seq_num, os.path.join(QUEUE_DIR, f)))
+
+        historical_files.sort(key=lambda item: item[0])
+
+        # 1.5 Normalizar: si existe status.json pero la cola NO está llena, pasarlo a histórico
+        # Esto puede suceder si se cambio el tamaño de la cola. Ejemplo que pase de 1 a 10
+        total_files = len(historical_files) + (1 if has_status else 0)
+        if has_status and total_files < max_reports:
+            next_hist_seq = (historical_files[-1][0] + 1) if historical_files else 1
+            restored_name = f"report_{next_hist_seq:06d}.json"
+            restored_path = os.path.join(QUEUE_DIR, restored_name)
+            os.replace(status_path, restored_path)
+            historical_files.append((next_hist_seq, restored_path))
+            has_status = False
+
+        # 2. Deducir la secuencia actual
+        max_historical_seq = historical_files[-1][0] if historical_files else 0
+        status_seq = max_historical_seq + 1 if has_status else 0
+        next_seq = (status_seq + 1) if has_status else (max_historical_seq + 1)
+
+        # 3. Purgar los archivos más antiguos si ya alcanzamos el límite total
+        total_files = len(historical_files) + (1 if has_status else 0)
+        while total_files >= max_reports and historical_files:
+            _, oldest_path = historical_files.pop(0)
+            os.remove(oldest_path)
+            total_files -= 1
+            syslog.syslog(syslog.LOG_WARNING, f"Queue ceiling reached. Purged oldest historical report item: {os.path.basename(oldest_path)}")
+
+        # 4. Escribir el nuevo reporte a /tmp
+        filename = f"report_{next_seq:06d}.json"
         filepath = os.path.join(QUEUE_DIR, filename)
+
+        # 5. Cambiar el flag de buffered a true pues es un reporte que se va a procesar desde la cola
+        report_data["buffered"] = True
         
         with open(filepath, "w") as f:
             json.dump(report_data, f)
-        syslog.syslog(syslog.LOG_INFO, f"Report successfully buffered locally to offline queue space: {filename}")
+
+        # 6. Rotar status.json solo al alcanzar el límite máximo
+        if total_files + 1 >= max_reports:
+            if has_status and max_reports > 1:
+                restored_path = os.path.join(QUEUE_DIR, f"report_{status_seq:06d}.json")
+                os.replace(status_path, restored_path)
+
+            filename = "status.json"
+            os.replace(filepath, status_path)
+
+        syslog.syslog(syslog.LOG_DEBUG, f"Report successfully buffered locally to offline queue space: {filename}")
+
     except Exception as e:
         syslog.syslog(syslog.LOG_ERR, f"Failed to execute volatile storage transaction: {str(e)}")
 
@@ -255,15 +319,24 @@ def process_pending_queue():
         return
 
     try:
-        files = [os.path.join(QUEUE_DIR, f) for f in os.listdir(QUEUE_DIR) if f.endswith(".json")]
-        if not files:
-            return
+        # Aplicamos la misma logica que al guardar en /tmp para garantizar se envien a la API en orden
+        status_path = os.path.join(QUEUE_DIR, "status.json")
+        has_status  = os.path.exists(status_path)
+        pattern = re.compile(r"^report_(\d+)\.json$")
+        files = []
+        
+        for f in os.listdir(QUEUE_DIR):
+            match = pattern.match(f)
+            if match:
+                seq_num = int(match.group(1))
+                files.append((seq_num, os.path.join(QUEUE_DIR, f)))
 
-        # Sort the directory array from oldest trace up to the newest record
-        files.sort(key=os.path.getmtime)
+        files.sort(key=lambda item: item[0])
+        if has_status:
+            files.append((0,status_path))
         syslog.syslog(syslog.LOG_INFO, f"Detected {len(files)} unsent diagnostic items in queue. Initiating upstream sync.")
 
-        for filepath in files:
+        for _, filepath in files:
             filename = os.path.basename(filepath)
             try:
                 with open(filepath, "r") as f:
@@ -293,10 +366,11 @@ if __name__ == "__main__":
     
     # Class instantiation mapped through explicit module tracking namespace
     collector = sysdiagnostic_collector.SysDiagnosticCollector()
+    previous_health = "desconocido"
     
     # Kernel driven operational event loop boundary
     while keep_running:
-        syslog.syslog(syslog.LOG_INFO, "Executing diagnostic daemon")
+        syslog.syslog(syslog.LOG_DEBUG, "Executing diagnostic daemon")
         
         # 1. Sync step: try to flush queued history files first
         process_pending_queue()
@@ -316,12 +390,14 @@ if __name__ == "__main__":
         
         # 3. Stream semantic operational summary down into local syslog infrastructure
         health_status = current_report["health"]["status"]
-        syslog.syslog(syslog.LOG_INFO, f"Estado del router: {health_status}")
+        if previous_health != health_status:
+            syslog.syslog(syslog.LOG_INFO, f"Estado del router actual: {health_status} estado previo: {previous_health}")
+            previous_health = health_status
         
         # 4. Process routing logic into upstream endpoints or down to local storage buckets
         if config["api_url"]:
             api_success, api_reason = send_to_api(current_report)
-            syslog.syslog(syslog.LOG_INFO, f"Resultado del envío API: {api_reason}")
+            syslog.syslog(syslog.LOG_DEBUG, f"Resultado del envío API: {api_reason}")
             if not api_success:
                 save_to_queue(current_report)
         else:

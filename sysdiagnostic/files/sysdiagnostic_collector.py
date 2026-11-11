@@ -81,8 +81,14 @@ class SysDiagnosticCollector:
                             status_report[srv] = "OK"
                             continue
                         if srv == "firewall":
-                            status_report[srv] = "OK"
-                            continue
+                            # Punto 2, del review: En sistemas modernos, el firewall no es un demonio activo que este en ejecución
+                            # por lo que no tiene un estado en ubus ni en /proc. Ubus regresa un objeto vacio por lo que para poder 
+                            # medir si esta activo el firewall verificamos que exista el archivo de tablas del kernel tal cual hice en C++.
+                            tablesPath = "/proc/net/ip_tables_names"
+
+                            if os.path.isfile(tablesPath):
+                                status_report[srv] = "OK"
+                                continue
                 status_report[srv] = "fail"
             return Result(success=True, data=status_report)
         except Exception as e:
@@ -178,7 +184,7 @@ class SysDiagnosticCollector:
             resolved_ip = socket.gethostbyname(host)
             return Result(success=True, data={"status": "success", "host": host, "resolved_ip": resolved_ip})
         except socket.gaierror as e:
-            return Result(success=True, data={"status": "failed", "host": host, "resolved_ip": None})
+            return Result(success=False, data={"status": "failed", "host": host, "resolved_ip": None})
 
     def run_latency_test(self, host, port):
         # Estimates network latency utilizing strict TCP errno inspection and Result patterns
@@ -235,7 +241,8 @@ class SysDiagnosticCollector:
             "services": {},
             "vpns": None,
             "diagnostics": {},
-            "health": {"status": "OK", "reasons": []}
+            "health": {"status": "OK", "reasons": []},
+            "buffered": False
         }
 
         reasons = []
@@ -362,12 +369,19 @@ class SysDiagnosticCollector:
         free_mem = report["resources"].get("free_memory_kb", -1)
         load_summary = report["system"].get("load_average_summary", -1.0)
 
-        if (self.total_memory_kb > 0 and free_mem >= 0 and (free_mem / self.total_memory_kb) < 0.05) or (load_summary > 4.0):
+        if ((self.total_memory_kb > 0 and free_mem >= 0 and (free_mem / self.total_memory_kb) < 0.05)
+            or (load_summary > 4.0)
+            or (not dns_test_res.success and not lat_test_res.success)
+        ):
             report["health"]["status"] = "critical"
             if load_summary > 4.0:
                 reasons.append("high_cpu_load")
             if self.total_memory_kb > 0 and free_mem >= 0 and (free_mem / self.total_memory_kb) < 0.05:
                 reasons.append("out_of_memory")
+            if not dns_test_res.success:
+                reasons.append("dns_test_failed")
+            if not lat_test_res.success:
+                reasons.append("latency_test_failed")
 
         # Degraded or infrastructure failure condition evaluations
         if report["health"]["status"] != "critical":
