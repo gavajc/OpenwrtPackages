@@ -241,7 +241,8 @@ class SysDiagnosticCollector:
             "services": {},
             "vpns": None,
             "diagnostics": {},
-            "health": {"status": "OK", "reasons": []}
+            "health": {"status": "OK", "reasons": []},
+            "buffered": False
         }
 
         reasons = []

@@ -292,11 +292,14 @@ def save_to_queue(report_data):
         # 4. Escribir el nuevo reporte a /tmp
         filename = f"report_{next_seq:06d}.json"
         filepath = os.path.join(QUEUE_DIR, filename)
+
+        # 5. Cambiar el flag de buffered a true pues es un reporte que se va a procesar desde la cola
+        report_data["buffered"] = True
         
         with open(filepath, "w") as f:
             json.dump(report_data, f)
 
-        # 5. Rotar status.json solo al alcanzar el límite máximo
+        # 6. Rotar status.json solo al alcanzar el límite máximo
         if total_files + 1 >= max_reports:
             if has_status and max_reports > 1:
                 restored_path = os.path.join(QUEUE_DIR, f"report_{status_seq:06d}.json")
